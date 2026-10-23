@@ -11,3 +11,6 @@ wpa=2
 wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP
 wpa_passphrase=CHANGE_ME
+# OFDM-only: 11b (DSSS) frames carry no CSI, so never let rate control fall back to them
+supported_rates=60 90 120 180 240 360 480 540
+basic_rates=60 120 240

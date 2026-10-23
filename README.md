@@ -13,7 +13,7 @@ Pi: server.py (stdlib) → SSE → index.html on :8765 → vorp tunnel https://c
 
 ## Why the Pi is the access point
 
-The home router's 2.4 GHz radio sends the ESP32 only 802.11b (DSSS 5.5 Mbps) frames. Those frames carry no CSI, so callbacks stopped after DHCP. With hostapd on the Pi's otherwise unused `wlan0`, the traffic is OFDM, which gives ~200–350 CSI packets/s. AMPDU RX is also disabled (`sdkconfig.defaults`), because aggregated frames carry no CSI either.
+The home router's 2.4 GHz radio sends the ESP32 only 802.11b (DSSS 5.5 Mbps) frames. Those frames carry no CSI, so callbacks stopped after DHCP. With hostapd on the Pi's otherwise unused `wlan0`, the traffic is OFDM, which gives a steady ~100 CSI packets/s (one per ping reply). The AP is also OFDM-only (`supported_rates`/`basic_rates`), and the ping timeout is 15 ms, because esp_ping waits for each reply and a lost reply used to stall CSI for the full timeout. AMPDU RX is also disabled (`sdkconfig.defaults`), because aggregated frames carry no CSI either.
 
 ## Firmware (ESP-IDF v5.5.1)
 
@@ -44,7 +44,7 @@ docker run -d --name csi-ui --restart unless-stopped --net host -v ~/csi-radar:/
 
 ## Tuning
 
-- Calibration runs at boot and on **Recalibrate**. It takes about 1000 packets (~4 s) of a still room, and the threshold is set to 2× the p99 variance.
+- Calibration runs at boot and on **Recalibrate**. It takes about 1000 packets (~10 s) of a still room, and the threshold is set to 2× the p99 variance.
 - **More / Less sensitive** scales the threshold by 1.5×. The threshold isn't persisted, so a reboot recalibrates.
 - Placement: put the ESP32 across the room from the Pi. Motion is detected near the line between them.
 

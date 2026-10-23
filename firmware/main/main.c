@@ -136,7 +136,7 @@ static void start_ping(esp_ip4_addr_t gw) {
     cfg.target_addr.type = IPADDR_TYPE_V4;
     cfg.count = ESP_PING_COUNT_INFINITE;
     cfg.interval_ms = 10;
-    cfg.timeout_ms = 1000;
+    cfg.timeout_ms = 15;  // esp_ping waits for each reply; a long timeout stalls CSI for that long on every lost packet
     cfg.data_size = 1;
     esp_ping_callbacks_t cbs = {0};
     ESP_ERROR_CHECK(esp_ping_new_session(&cfg, &cbs, &ping));
