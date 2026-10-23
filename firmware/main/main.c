@@ -1,8 +1,6 @@
-// Wi-Fi CSI motion radar: ping the Pi's AP at 100 Hz, read CSI off its replies,
-// detect motion on-chip (moving variance of spatial turbulence), stream to the Pi over UDP.
-#include <math.h>
+// Wi-Fi CSI capture: ping the Pi's AP at 100 Hz, read CSI off its replies, stream raw I/Q to the Pi.
+// Detection runs on the Pi (easier to iterate); it drives the LED back over UDP.
 #include <string.h>
-#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "esp_wifi.h"
@@ -13,118 +11,58 @@
 #include "driver/gpio.h"
 #include "lwip/sockets.h"
 #include "ping/ping_sock.h"
-#include "secrets.h"  // WIFI_SSID, WIFI_PASS, PI_HOST (gitignored)
+#include "secrets.h"  // WIFI_SSID, WIFI_PASS, PI_HOST, ESP_IP (gitignored)
 
 #define PI_PORT   5005
 #define CMD_PORT  5006
 #define LED_GPIO  2
 #define NSUB      52    // LLTF subcarriers -26..-1, 1..26
-#define WIN       50    // moving-variance window, packets (~0.5 s)
-#define CAL_N     1000  // calibration samples (~10 s, room should be still)
-#define SEND_EVERY 10   // ~10 frames/s to the Pi
-#define HOLD      50    // keep "motion" on this many packets after last trigger
+#define BATCH     10    // packets per UDP datagram (~10 datagrams/s)
 
 static const char *TAG = "radar";
 
-typedef struct { uint8_t amp[NSUB]; int8_t rssi; } sample_t;
+// wire format (little-endian): "CS", version=2, count, then count x { u32 ms, i8 rssi, i8 iq[2*NSUB] (imag, real) }
+typedef struct __attribute__((packed)) { uint32_t ms; int8_t rssi; int8_t iq[2 * NSUB]; } sample_t;
 
 static QueueHandle_t q;
 static uint8_t ap_bssid[6];
-static volatile bool cal_req = true;
-static volatile float thr = 0;  // 0 = calibrating
 
 static void csi_cb(void *ctx, wifi_csi_info_t *info) {
     if (info->len < 128 || memcmp(info->mac, ap_bssid, 6)) return;
-    sample_t s = { .rssi = info->rx_ctrl.rssi };
+    sample_t s = { .ms = esp_timer_get_time() / 1000, .rssi = info->rx_ctrl.rssi };
     // buf = (imag, real) int8 pairs; index k<32 is subcarrier k, k>=32 is k-64.
     // Keep -26..-1 (k=38..63) then 1..26 (k=1..26); skip DC and guard bands.
-    int n = 0;
-    for (int k = 38; k < 64; k++, n++) s.amp[n] = (uint8_t)hypotf(info->buf[2*k], info->buf[2*k+1]);
-    for (int k = 1; k <= 26; k++, n++)  s.amp[n] = (uint8_t)hypotf(info->buf[2*k], info->buf[2*k+1]);
-    xQueueSend(q, &s, 0);  // drop if the processor is behind
+    memcpy(s.iq, info->buf + 2 * 38, 2 * 26);
+    memcpy(s.iq + 2 * 26, info->buf + 2 * 1, 2 * 26);
+    xQueueSend(q, &s, 0);  // drop if the sender is behind
 }
 
-static int cmp_float(const void *a, const void *b) {
-    float d = *(const float *)a - *(const float *)b;
-    return (d > 0) - (d < 0);
-}
-
-static void process_task(void *arg) {
+static void send_task(void *arg) {
     int tx = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in pi = { .sin_family = AF_INET, .sin_port = htons(PI_PORT) };
     inet_pton(AF_INET, PI_HOST, &pi.sin_addr);
-
-    static float turb[WIN], cal[CAL_N];
-    static uint32_t acc[NSUB];
-    static char json[700];
-    int ti = 0, tn = 0, cn = 0, hold = 0, nacc = 0, pps = 0, pcount = 0;
-    int64_t pps_t = esp_timer_get_time();
-    sample_t s;
-
+    static uint8_t pkt[4 + BATCH * sizeof(sample_t)] = { 'C', 'S', 2 };
+    int n = 0;
     for (;;) {
-        if (!xQueueReceive(q, &s, portMAX_DELAY)) continue;
-        if (cal_req) { cal_req = false; thr = 0; cn = 0; }
-
-        // spatial turbulence: coefficient of variation across subcarriers (gain-invariant)
-        float sum = 0, sq = 0;
-        for (int i = 0; i < NSUB; i++) { sum += s.amp[i]; sq += (float)s.amp[i] * s.amp[i]; acc[i] += s.amp[i]; }
-        float mean = sum / NSUB;
-        float t = mean > 0 ? sqrtf(fmaxf(sq / NSUB - mean * mean, 0)) / mean : 0;
-        turb[ti] = t; ti = (ti + 1) % WIN; if (tn < WIN) tn++;
-        nacc++;
-
-        float m = 0, v = 0;
-        for (int i = 0; i < tn; i++) m += turb[i];
-        m /= tn;
-        for (int i = 0; i < tn; i++) v += (turb[i] - m) * (turb[i] - m);
-        v /= tn;
-
-        if (thr == 0 && tn == WIN) {
-            cal[cn++] = v;
-            if (cn == CAL_N) {
-                // ponytail: p99 of a still room x2; the UI slider overrides it if your room needs more/less
-                qsort(cal, CAL_N, sizeof(float), cmp_float);
-                thr = fmaxf(cal[CAL_N * 99 / 100] * 2.0f, 1e-7f);
-                ESP_LOGI(TAG, "calibrated thr=%g", thr);
-            }
-        }
-        if (thr > 0 && v > thr) hold = HOLD;
-        bool motion = hold > 0;
-        if (hold) hold--;
-        gpio_set_level(LED_GPIO, motion);
-
-        pcount++;
-        int64_t now = esp_timer_get_time();
-        if (now - pps_t >= 1000000) { pps = pcount; pcount = 0; pps_t = now; }
-
-        if (nacc >= SEND_EVERY) {
-            int n = snprintf(json, sizeof json,
-                "{\"ms\":%lld,\"var\":%.4g,\"thr\":%.4g,\"motion\":%d,\"cal\":%d,\"rssi\":%d,\"pps\":%d,\"amp\":[",
-                now / 1000, v, thr, motion, thr == 0 ? cn * 100 / CAL_N : 100, s.rssi, pps);
-            for (int i = 0; i < NSUB; i++) {
-                n += snprintf(json + n, sizeof json - n, i ? ",%lu" : "%lu", (unsigned long)(acc[i] / nacc));
-                acc[i] = 0;
-            }
-            n += snprintf(json + n, sizeof json - n, "]}");
-            nacc = 0;
-            sendto(tx, json, n, 0, (struct sockaddr *)&pi, sizeof pi);
-        }
+        if (!xQueueReceive(q, pkt + 4 + n * sizeof(sample_t), portMAX_DELAY)) continue;
+        if (++n < BATCH) continue;
+        pkt[3] = n;
+        sendto(tx, pkt, 4 + n * sizeof(sample_t), 0, (struct sockaddr *)&pi, sizeof pi);
+        n = 0;
     }
 }
 
-// "cal" recalibrates, "thr <float>" sets the threshold.
+// "led 0" / "led 1"
 static void cmd_task(void *arg) {
     int rx = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in me = { .sin_family = AF_INET, .sin_port = htons(CMD_PORT), .sin_addr.s_addr = htonl(INADDR_ANY) };
     bind(rx, (struct sockaddr *)&me, sizeof me);
-    char buf[64];
+    char buf[16];
     for (;;) {
         int n = recv(rx, buf, sizeof buf - 1, 0);
         if (n <= 0) continue;
         buf[n] = 0;
-        if (!strncmp(buf, "cal", 3)) cal_req = true;
-        else if (!strncmp(buf, "thr ", 4)) { float f = strtof(buf + 4, NULL); if (f > 0) thr = f; }
-        ESP_LOGI(TAG, "cmd: %s", buf);
+        if (!strncmp(buf, "led ", 4)) gpio_set_level(LED_GPIO, buf[4] == '1');
     }
 }
 
@@ -195,6 +133,6 @@ void app_main(void) {
 
     q = xQueueCreate(64, sizeof(sample_t));
 
-    xTaskCreate(process_task, "process", 6144, NULL, 5, NULL);
+    xTaskCreate(send_task, "send", 4096, NULL, 5, NULL);
     xTaskCreate(cmd_task, "cmd", 3072, NULL, 4, NULL);
 }

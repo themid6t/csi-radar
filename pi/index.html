@@ -4,26 +4,32 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CSI Radar</title>
+<script type="importmap">
+{"imports": {"three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+             "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
 <style>
   :root {
     --bg: #0d1117; --panel: #161b22; --line: #30363d; --text: #e6edf3; --muted: #8b949e;
-    --accent: #58a6ff; --motion: #f85149; --still: #3fb950; --warn: #d29922;
+    --accent: #58a6ff; --motion: #f85149; --still: #3fb950; --warn: #d29922; --breath: #a371f7;
   }
   @media (prefers-color-scheme: light) {
     :root { --bg: #f6f8fa; --panel: #ffffff; --line: #d0d7de; --text: #1f2328; --muted: #656d76;
-            --accent: #0969da; --motion: #cf222e; --still: #1a7f37; --warn: #9a6700; }
+            --accent: #0969da; --motion: #cf222e; --still: #1a7f37; --warn: #9a6700; --breath: #8250df; }
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text);
          font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 40px; }
-  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
-  h1 { font-size: 20px; margin: 0; letter-spacing: .2px; }
+  main { max-width: 1200px; margin: 0 auto; padding: 20px 16px 40px; }
+  header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  h1 { font-size: 20px; margin: 0; }
   .pill { padding: 4px 12px; border-radius: 999px; font-weight: 600; font-size: 13px;
           border: 1px solid var(--line); background: var(--panel); }
   .pill.motion { background: var(--motion); border-color: var(--motion); color: #fff; animation: pulse 1s infinite; }
   .pill.still { color: var(--still); border-color: var(--still); }
-  .pill.cal, .pill.off { color: var(--warn); border-color: var(--warn); }
+  .pill.off { color: var(--warn); border-color: var(--warn); }
+  .pill.breath { color: var(--breath); border-color: var(--breath); }
+  .pill[hidden] { display: none; }
   @keyframes pulse { 50% { opacity: .7; } }
   .spacer { flex: 1; }
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
@@ -31,25 +37,45 @@
   .tile { padding: 10px 14px; }
   .tile .k { color: var(--muted); font-size: 12px; }
   .tile .v { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
-  .card { padding: 12px 14px 14px; margin-bottom: 14px; }
+  .tile .s { color: var(--muted); font-size: 12px; min-height: 1em; }
+  .card { padding: 12px 14px 14px; margin-bottom: 14px; min-width: 0; }
   .card h2 { font-size: 13px; font-weight: 600; color: var(--muted); margin: 0 0 8px;
-             display: flex; justify-content: space-between; gap: 8px; }
+             display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  .legend { font-weight: 400; }
   canvas { width: 100%; display: block; border-radius: 6px; }
-  #wf { height: 220px; image-rendering: pixelated; background: #000; }
-  #chart { height: 180px; }
+  #wf { height: 180px; background: #000; }
+  #chart { height: 200px; }
+  #scene { position: relative; height: 420px; border-radius: 6px; overflow: hidden; background: #05070b; }
+  #scene canvas { height: 100%; }
+  #scene .note { position: absolute; left: 10px; bottom: 8px; right: 10px; color: #8b949e; font-size: 12px; pointer-events: none; }
+  #scene .err { position: absolute; inset: 0; display: grid; place-items: center; color: #8b949e; }
   .row { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; }
-  @media (max-width: 760px) { .row { grid-template-columns: 1fr; } }
+  @media (max-width: 820px) { .row { grid-template-columns: 1fr; } #scene { height: 320px; } }
   button { font: inherit; padding: 6px 12px; border-radius: 6px; cursor: pointer;
            border: 1px solid var(--line); background: var(--panel); color: var(--text); }
-  button:hover { border-color: var(--accent); }
-  .controls { display: flex; gap: 8px; flex-wrap: wrap; }
-  #events { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0 10px; }
+  #events { list-style: none; margin: 0; padding: 0; max-height: 420px; overflow-y: auto; }
   #events li { display: flex; justify-content: space-between; padding: 6px 0;
                border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
   #events li.live { color: var(--motion); font-weight: 600; }
   .muted { color: var(--muted); }
-  .legend { font-weight: 400; }
-  footer { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .small { font-size: 12px; }
+  label.thr { display: flex; align-items: center; gap: 10px; }
+  input[type=range] { flex: 1; accent-color: var(--accent); }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin: 6px 0; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  td, th { text-align: left; padding: 3px 4px; border-bottom: 1px solid var(--line); font-size: 13px; }
+  th { color: var(--muted); font-weight: 500; }
+  .warnbox { border-left: 3px solid var(--warn); padding: 6px 10px; margin-top: 10px; font-size: 13px; }
+  details summary { cursor: pointer; color: var(--muted); font-weight: 600; font-size: 13px; }
+  .grid3 { display: grid; grid-template-columns: auto repeat(3, 1fr); gap: 6px 8px; align-items: center; margin: 10px 0; }
+  .grid3 input { width: 100%; font: inherit; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--line);
+                 background: var(--bg); color: var(--text); }
+  footer { color: var(--muted); font-size: 12px; margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -57,69 +83,93 @@
   <header>
     <h1>CSI Radar</h1>
     <span id="state" class="pill off">connecting…</span>
+    <span id="breathPill" class="pill breath" hidden></span>
     <span class="spacer"></span>
-    <div class="controls">
-      <button id="more" title="Lower the threshold">More sensitive</button>
-      <button id="less" title="Raise the threshold">Less sensitive</button>
-      <button id="cal" title="Keep the room still for ~10 s">Recalibrate</button>
-    </div>
+    <span class="muted small" id="thrLabel"></span>
   </header>
 
   <div class="tiles">
-    <div class="tile"><div class="k">Motion score</div><div class="v" id="score">–</div></div>
-    <div class="tile"><div class="k">Last motion</div><div class="v" id="last">–</div></div>
-    <div class="tile"><div class="k">Signal (RSSI)</div><div class="v" id="rssi">–</div></div>
-    <div class="tile"><div class="k">CSI packets / s</div><div class="v" id="pps">–</div></div>
-  </div>
-
-  <div class="card">
-    <h2>Subcarrier waterfall <span class="legend">52 subcarriers × last 60 s · amplitude relative to frame mean</span></h2>
-    <canvas id="wf"></canvas>
+    <div class="tile"><div class="k">Motion statistic</div><div class="v" id="ms">–</div><div class="s">0 = static · 1 = strong motion</div></div>
+    <div class="tile"><div class="k">Breathing</div><div class="v" id="bpm">–</div><div class="s">experimental · still person near the link</div></div>
+    <div class="tile"><div class="k">Last motion</div><div class="v" id="last">–</div><div class="s" id="evtotal"></div></div>
+    <div class="tile"><div class="k">Signal (RSSI)</div><div class="v" id="rssi">–</div><div class="s">ESP32 ← Pi</div></div>
+    <div class="tile"><div class="k">CSI packets / s</div><div class="v" id="pps">–</div><div class="s">target ~100</div></div>
   </div>
 
   <div class="row">
     <div class="card">
-      <h2>Turbulence variance <span class="legend">log scale · dashed = threshold · red = motion</span></h2>
-      <canvas id="chart"></canvas>
+      <h2>Room <span class="legend">drag to orbit · scroll to zoom</span></h2>
+      <div id="scene"><div class="note">One link senses motion inside the glowing zone around the Pi–ESP32 line (Fresnel zones). It can't tell where along the zone the motion is; more ESP32s would be needed for that.</div></div>
     </div>
     <div class="card">
       <h2>Events <span class="legend" id="evcount"></span></h2>
       <ul id="events"><li class="muted">No motion yet</li></ul>
     </div>
   </div>
-  <footer>ESP32 pings the Pi's access point ~100×/s and reads Wi-Fi channel state on every reply. Motion = variance of subcarrier turbulence above the calibrated threshold.</footer>
+
+  <div class="row">
+    <div class="card">
+      <h2>Motion statistic <span class="legend">last 60 s · dashed = threshold · red = motion</span></h2>
+      <canvas id="chart"></canvas>
+      <h2 style="margin-top:12px">Subcarrier waterfall <span class="legend">52 subcarriers × 60 s · amplitude relative to frame mean</span></h2>
+      <canvas id="wf"></canvas>
+    </div>
+    <div class="card">
+      <h2>Tuning</h2>
+      <label class="thr"><span>Threshold</span><input type="range" id="thr" min="0.05" max="0.8" step="0.01"><b id="thrVal">–</b></label>
+      <p class="muted small">Record each situation for 30 s and the threshold is tuned from your room. Start with "Empty room" (leave the room), then "Walking" (walk around between the Pi and the ESP32).</p>
+      <div class="btns">
+        <button data-rec="empty">Empty room</button>
+        <button data-rec="walking">Walking</button>
+        <button data-rec="still">Sitting still</button>
+        <button id="cal" title="Quick: assumes the room is empty for 10 s">Quick calibrate</button>
+      </div>
+      <div id="job" hidden><span class="small" id="jobText"></span><div class="bar"><div id="jobBar"></div></div></div>
+      <table id="recTable"><tr><th>Recording</th><th>median</th><th>p99</th></tr></table>
+      <div id="tuned" class="small" style="margin-top:8px"></div>
+      <div id="tones" class="warnbox" hidden></div>
+      <details style="margin-top:14px">
+        <summary>Room setup (metres)</summary>
+        <div class="grid3">
+          <span></span><span class="muted small">x / width</span><span class="muted small">y / depth</span><span class="muted small">z / height</span>
+          <span>Room</span><input data-k="room" data-i="0" type="number" step="0.1"><input data-k="room" data-i="1" type="number" step="0.1"><input data-k="room" data-i="2" type="number" step="0.1">
+          <span>Pi</span><input data-k="pi" data-i="0" type="number" step="0.1"><input data-k="pi" data-i="1" type="number" step="0.1"><input data-k="pi" data-i="2" type="number" step="0.1">
+          <span>ESP32</span><input data-k="esp" data-i="0" type="number" step="0.1"><input data-k="esp" data-i="1" type="number" step="0.1"><input data-k="esp" data-i="2" type="number" step="0.1">
+        </div>
+        <button id="saveCfg">Save</button> <span class="small muted" id="cfgMsg"></span>
+      </details>
+    </div>
+  </div>
+  <footer>The ESP32 pings the Pi's access point ~100×/s and streams the channel state of every reply. Motion = lag-1 autocorrelation of subcarrier amplitudes over 1 s (WiDetect). Breathing = 0.1–0.7 Hz peak of the top principal components over 30 s.</footer>
 </main>
 
-<script>
+<script type="module">
 const N = 600, NSUB = 52;
 const frames = [];
-let events = [], online = false, thr = 0, last = null, dirty = true;
+let events = [], online = false, meta = null, dirty = true;
 const $ = id => document.getElementById(id);
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 
-// colormap: dark blue -> teal -> yellow
+// ---------- waterfall ----------
 const STOPS = [[13, 8, 135], [84, 2, 163], [139, 10, 165], [185, 50, 137], [219, 92, 104], [244, 136, 73], [254, 188, 43], [240, 249, 33]];
 const CMAP = Array.from({length: 256}, (_, i) => {
   const x = i / 255 * (STOPS.length - 1), a = Math.floor(x), b = Math.min(a + 1, STOPS.length - 1), t = x - a;
   return STOPS[a].map((c, k) => Math.round(c + (STOPS[b][k] - c) * t));
 });
-
-const wfBuf = document.createElement("canvas");
-wfBuf.width = N; wfBuf.height = NSUB;
+const wfBuf = Object.assign(document.createElement("canvas"), {width: N, height: NSUB});
 const wfCtx = wfBuf.getContext("2d");
 wfCtx.fillStyle = "#000"; wfCtx.fillRect(0, 0, N, NSUB);
 const col = wfCtx.createImageData(1, NSUB);
-
 function pushColumn(amp) {
   wfCtx.drawImage(wfBuf, -1, 0);
   const mean = amp.reduce((a, b) => a + b, 0) / amp.length || 1;
   for (let i = 0; i < NSUB; i++) {
     const v = Math.max(0, Math.min(255, Math.round((amp[i] / mean - 0.4) / 1.2 * 255)));
-    const [r, g, b] = CMAP[v], o = (NSUB - 1 - i) * 4;  // subcarrier -26 at the bottom
+    const [r, g, b] = CMAP[v], o = (NSUB - 1 - i) * 4;
     col.data[o] = r; col.data[o + 1] = g; col.data[o + 2] = b; col.data[o + 3] = 255;
   }
   wfCtx.putImageData(col, N - 1, 0);
 }
-
 function fit(c) {
   const r = c.getBoundingClientRect(), d = devicePixelRatio || 1;
   if (c.width !== Math.round(r.width * d) || c.height !== Math.round(r.height * d)) {
@@ -127,104 +177,264 @@ function fit(c) {
   }
   return c.getContext("2d");
 }
-
-function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
-
 function drawWaterfall() {
   const c = $("wf"), ctx = fit(c);
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(wfBuf, 0, 0, c.width, c.height);
 }
 
+// ---------- chart ----------
 function drawChart() {
   const c = $("chart"), ctx = fit(c), W = c.width, H = c.height, d = devicePixelRatio || 1;
   ctx.clearRect(0, 0, W, H);
-  if (!frames.length) return;
-  const t = Math.log10(thr || frames[frames.length - 1].thr || 1e-4);
-  const lo = t - 2, hi = t + 2;
-  const y = v => H - (Math.min(hi, Math.max(lo, Math.log10(Math.max(v, 1e-12)))) - lo) / (hi - lo) * H;
+  const pad = 22 * d, ph = H - pad;
+  const y = v => ph - Math.max(0, Math.min(1, v)) * (ph - 4 * d) + 2 * d;
   const x = i => (i + N - frames.length) / (N - 1) * W;
-
+  ctx.font = `${11 * d}px system-ui`; ctx.fillStyle = css("--muted"); ctx.strokeStyle = css("--line"); ctx.lineWidth = 1;
+  for (const v of [0, 0.25, 0.5, 0.75, 1]) {
+    ctx.beginPath(); ctx.moveTo(0, y(v)); ctx.lineTo(W, y(v)); ctx.stroke();
+    ctx.fillText(v.toFixed(2), 4 * d, v === 1 ? y(v) + 12 * d : y(v) - 3 * d);
+  }
+  ctx.fillText("−60 s", 4 * d, H - 6 * d); ctx.textAlign = "right"; ctx.fillText("now", W - 4 * d, H - 6 * d); ctx.textAlign = "left";
+  if (!frames.length) return;
   ctx.fillStyle = css("--motion") + "33";
-  frames.forEach((f, i) => { if (f.motion) ctx.fillRect(x(i), 0, W / N + 1, H); });
-
-  ctx.strokeStyle = css("--line"); ctx.lineWidth = 1;
-  for (let k = Math.ceil(lo); k <= hi; k++) { ctx.beginPath(); ctx.moveTo(0, y(10 ** k)); ctx.lineTo(W, y(10 ** k)); ctx.stroke(); }
-
+  frames.forEach((f, i) => { if (f.motion) ctx.fillRect(x(i), 0, W / N + 1, ph); });
   ctx.strokeStyle = css("--warn"); ctx.setLineDash([6 * d, 4 * d]); ctx.lineWidth = 1.5 * d;
   ctx.beginPath(); frames.forEach((f, i) => i ? ctx.lineTo(x(i), y(f.thr)) : ctx.moveTo(x(i), y(f.thr))); ctx.stroke();
   ctx.setLineDash([]);
-
   ctx.strokeStyle = css("--accent"); ctx.lineWidth = 1.5 * d;
-  ctx.beginPath(); frames.forEach((f, i) => i ? ctx.lineTo(x(i), y(f.var)) : ctx.moveTo(x(i), y(f.var))); ctx.stroke();
+  ctx.beginPath(); frames.forEach((f, i) => i ? ctx.lineTo(x(i), y(f.ms)) : ctx.moveTo(x(i), y(f.ms))); ctx.stroke();
 }
 
+// ---------- status / events / tuning ----------
 const fmtTime = s => new Date(s * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
 function ago(s) {
   const d = Date.now() / 1000 - s;
   return d < 60 ? `${Math.round(d)}s ago` : d < 3600 ? `${Math.round(d / 60)}m ago` : `${Math.round(d / 3600)}h ago`;
 }
-
 function drawEvents() {
   const ul = $("events");
   $("evcount").textContent = events.length ? `${events.length} total` : "";
   if (!events.length) { ul.innerHTML = '<li class="muted">No motion yet</li>'; return; }
   ul.innerHTML = "";
-  for (const e of events.slice().reverse().slice(0, 50)) {
+  for (const e of events.slice().reverse().slice(0, 100)) {
     const li = document.createElement("li");
     if (e.end === null) li.className = "live";
     li.innerHTML = `<span>${fmtTime(e.start)}</span><span>${e.end === null ? "ongoing" : (e.end - e.start).toFixed(1) + " s"}</span>`;
     ul.appendChild(li);
   }
 }
-
 function drawStatus() {
   const f = frames[frames.length - 1], s = $("state");
   if (!online || !f) { s.className = "pill off"; s.textContent = "ESP32 offline"; }
-  else if (f.cal < 100) { s.className = "pill cal"; s.textContent = `calibrating ${f.cal}% · keep still`; }
   else if (f.motion) { s.className = "pill motion"; s.textContent = "MOTION"; }
-  else { s.className = "pill still"; s.textContent = "still"; }
+  else { s.className = "pill still"; s.textContent = "no motion"; }
+  const bp = $("breathPill");
+  bp.hidden = !(online && f && f.bpm);
+  if (f && f.bpm) bp.textContent = `someone still · ${Math.round(f.bpm)} breaths/min`;
   if (f) {
-    $("score").textContent = f.thr ? (f.var / f.thr).toFixed(2) + "×" : "–";
+    $("ms").textContent = f.ms.toFixed(2);
+    $("bpm").textContent = f.bpm ? Math.round(f.bpm) + " /min" : "–";
     $("rssi").textContent = f.rssi + " dBm";
     $("pps").textContent = f.pps;
+    const j = f.job;
+    $("job").hidden = !j;
+    if (j) {
+      $("jobText").textContent = j.kind === "cal" ? "Calibrating, keep the room empty…" : `Recording "${j.label}"…`;
+      $("jobBar").style.width = j.pct + "%";
+    }
+    document.querySelectorAll("[data-rec], #cal").forEach(b => b.disabled = !!j);
+    const t = $("tones");
+    t.hidden = !f.tones.length;
+    if (f.tones.length) t.textContent = `Periodic interference at ${f.tones.map(x => x[0] + " Hz").join(", ")}, probably a ceiling fan or other spinning thing in the room. It keeps the channel moving, which can hide small motions or cause false alarms. Switch it off for the best results.`;
   }
   const lastEv = events[events.length - 1];
   $("last").textContent = lastEv ? (lastEv.end === null ? "now" : ago(lastEv.end)) : "–";
 }
-
+function drawMeta() {
+  if (!meta) return;
+  $("thrLabel").textContent = `threshold ${meta.thr.toFixed(2)}`;
+  if (document.activeElement !== $("thr")) { $("thr").value = meta.thr; $("thrVal").textContent = meta.thr.toFixed(2); }
+  const names = {empty: "Empty room", walking: "Walking", still: "Sitting still"};
+  $("recTable").innerHTML = "<tr><th>Recording</th><th>median</th><th>p99</th></tr>" +
+    Object.keys(names).map(k => meta.rec[k] ? `<tr><td>${names[k]}</td><td>${meta.rec[k].p50.toFixed(3)}</td><td>${meta.rec[k].p99.toFixed(3)}</td></tr>`
+                                            : `<tr><td>${names[k]}</td><td class="muted">–</td><td class="muted">–</td></tr>`).join("");
+  const tu = meta.tuned;
+  $("tuned").innerHTML = tu
+    ? `Suggested threshold <b>${tu.thr.toFixed(3)}</b> ${tu.separable ? "(empty and walking separate cleanly)" : "(they overlap, so walking may be missed sometimes; check the fan / placement)"} <button id="apply" class="primary">Apply</button>`
+    : '<span class="muted">Record "Empty room" and "Walking" to get a suggested threshold.</span>';
+  if (tu) $("apply").onclick = () => cmd("apply");
+  for (const inp of document.querySelectorAll(".grid3 input"))
+    if (document.activeElement !== inp) inp.value = meta.config[inp.dataset.k][inp.dataset.i];
+  scene3d?.setConfig(meta.config);
+}
+function addFrame(f) {
+  frames.push(f); if (frames.length > N) frames.shift();
+  pushColumn(f.amp); dirty = true;
+}
 function render() {
   if (dirty) { drawWaterfall(); drawChart(); drawStatus(); dirty = false; }
   requestAnimationFrame(render);
 }
 
-function addFrame(f) {
-  frames.push(f); if (frames.length > N) frames.shift();
-  thr = f.thr; pushColumn(f.amp); dirty = true;
-}
-
+// ---------- network ----------
 function connect() {
   const es = new EventSource("events");
   es.addEventListener("init", e => {
     const d = JSON.parse(e.data);
-    frames.length = 0; online = d.online; events = d.events;
-    d.history.forEach(addFrame); drawEvents();
+    frames.length = 0; online = d.online; events = d.events; meta = d.meta;
+    d.history.forEach(addFrame); drawEvents(); drawMeta();
   });
-  es.addEventListener("frame", e => { online = true; addFrame(JSON.parse(e.data)); });
+  es.addEventListener("frame", e => { online = true; const f = JSON.parse(e.data); addFrame(f); scene3d?.update(f); });
   es.addEventListener("events", e => { events = JSON.parse(e.data); drawEvents(); dirty = true; });
+  es.addEventListener("meta", e => { meta = JSON.parse(e.data); drawMeta(); });
   es.addEventListener("status", e => { online = JSON.parse(e.data).online; dirty = true; });
   es.onerror = () => { online = false; dirty = true; };
 }
-
-function cmd(body) { return fetch("cmd", {method: "POST", body}); }
-$("more").onclick = () => thr && cmd(`thr ${(thr / 1.5).toPrecision(4)}`);
-$("less").onclick = () => thr && cmd(`thr ${(thr * 1.5).toPrecision(4)}`);
+const cmd = body => fetch("cmd", {method: "POST", body});
+document.querySelectorAll("[data-rec]").forEach(b => b.onclick = () => cmd("rec " + b.dataset.rec));
 $("cal").onclick = () => cmd("cal");
-
+$("thr").oninput = e => $("thrVal").textContent = (+e.target.value).toFixed(2);
+$("thr").onchange = e => cmd("thr " + (+e.target.value).toFixed(2));
+$("saveCfg").onclick = async () => {
+  const c = {room: [0, 0, 0], pi: [0, 0, 0], esp: [0, 0, 0]};
+  for (const inp of document.querySelectorAll(".grid3 input")) c[inp.dataset.k][inp.dataset.i] = +inp.value;
+  const r = await fetch("config", {method: "POST", body: JSON.stringify(c)});
+  $("cfgMsg").textContent = r.ok ? "saved" : "invalid: both devices must be inside the room";
+};
 addEventListener("resize", () => dirty = true);
-setInterval(() => { dirty = true; }, 5000);  // refresh "x ago"
+setInterval(() => { dirty = true; }, 5000);
+
+// ---------- 3D room ----------
+let scene3d = null;
+async function init3d() {
+  const host = $("scene");
+  let THREE, OrbitControls;
+  try {
+    THREE = await import("three");
+    ({OrbitControls} = await import("three/addons/controls/OrbitControls.js"));
+  } catch {
+    host.insertAdjacentHTML("beforeend", '<div class="err">3D view unavailable (couldn\'t load three.js)</div>');
+    return;
+  }
+  const LAMBDA = 0.125;  // 2.4 GHz wavelength, m
+  const renderer = new THREE.WebGLRenderer({antialias: true});
+  renderer.setPixelRatio(devicePixelRatio);
+  host.prepend(renderer.domElement);
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x05070b);
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.05, 100);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true; controls.autoRotate = true; controls.autoRotateSpeed = 0.4;
+  renderer.domElement.addEventListener("pointerdown", () => controls.autoRotate = false);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.8); sun.position.set(3, 6, 2); scene.add(sun);
+
+  const roomGroup = new THREE.Group(); scene.add(roomGroup);
+  const linkGroup = new THREE.Group(); scene.add(linkGroup);
+
+  function label(text, color) {
+    const c = Object.assign(document.createElement("canvas"), {width: 256, height: 64});
+    const g = c.getContext("2d");
+    g.font = "600 34px system-ui"; g.fillStyle = color; g.textAlign = "center"; g.fillText(text, 128, 44);
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({map: new THREE.CanvasTexture(c), depthTest: false, transparent: true}));
+    s.scale.set(0.8, 0.2, 1);
+    return s;
+  }
+  // config [x, y(depth), z(height)] -> three (x, height, depth)
+  const v3 = p => new THREE.Vector3(p[0], p[2], p[1]);
+
+  const zoneMat = (op) => new THREE.MeshBasicMaterial({color: 0x58a6ff, transparent: true, opacity: op, depthWrite: false, blending: THREE.AdditiveBlending});
+  let inner, outer, a = new THREE.Vector3(), b = new THREE.Vector3(), particles = [];
+  const pGeo = new THREE.SphereGeometry(0.03, 8, 8);
+
+  function setConfig(cfg) {
+    roomGroup.clear(); linkGroup.clear(); particles = [];
+    const [w, d, h] = cfg.room;
+    const box = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(w, h, d)), new THREE.LineBasicMaterial({color: 0x3a4250}));
+    box.position.set(w / 2, h / 2, d / 2); roomGroup.add(box);
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(w, d), new THREE.MeshStandardMaterial({color: 0x121821, side: THREE.DoubleSide}));
+    floor.rotation.x = -Math.PI / 2; floor.position.set(w / 2, 0, d / 2); roomGroup.add(floor);
+    const grid = new THREE.GridHelper(Math.max(w, d), Math.round(Math.max(w, d) * 2), 0x26303c, 0x1a212b);
+    grid.position.set(Math.max(w, d) / 2, 0.001, Math.max(w, d) / 2); roomGroup.add(grid);
+
+    a = v3(cfg.pi); b = v3(cfg.esp);
+    const pi = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.06, 0.12), new THREE.MeshStandardMaterial({color: 0x3fb950}));
+    pi.position.copy(a); linkGroup.add(pi);
+    const esp = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.02, 0.05), new THREE.MeshStandardMaterial({color: 0x58a6ff}));
+    esp.position.copy(b); linkGroup.add(esp);
+    for (const [p, t, c] of [[a, "Pi (AP)", "#3fb950"], [b, "ESP32", "#58a6ff"]]) {
+      const l = label(t, c); l.position.copy(p).add(new THREE.Vector3(0, 0.25, 0)); linkGroup.add(l);
+      const stem = new THREE.Line(new THREE.BufferGeometry().setFromPoints([p, new THREE.Vector3(p.x, 0, p.z)]),
+                                  new THREE.LineDashedMaterial({color: 0x3a4250, dashSize: 0.05, gapSize: 0.05}));
+      stem.computeLineDistances(); linkGroup.add(stem);
+    }
+    linkGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([a, b]), new THREE.LineBasicMaterial({color: 0x8b949e})));
+
+    // Fresnel zones: ellipsoids with foci at the two antennas. Zone n semi-minor axis ~ sqrt(n*lambda*d)/2.
+    const dist = a.distanceTo(b), mid = a.clone().add(b).multiplyScalar(0.5);
+    const dir = b.clone().sub(a).normalize();
+    const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(1, 0, 0), dir);
+    const mk = (n, op) => {
+      const r = Math.sqrt(n * LAMBDA * dist) / 2;
+      const m = new THREE.Mesh(new THREE.SphereGeometry(1, 48, 24), zoneMat(op));
+      m.scale.set(dist / 2 + r * 0.3, r, r); m.position.copy(mid); m.quaternion.copy(q);
+      m.userData.base = m.scale.clone();
+      linkGroup.add(m); return m;
+    };
+    outer = mk(8, 0.05); inner = mk(1, 0.12);
+
+    const c = new THREE.Vector3(w / 2, h / 2, d / 2);
+    controls.target.copy(c);
+    camera.position.set(c.x + w * 0.9, h * 1.9, c.z + d * 1.5);
+  }
+
+  let intensity = 0, motion = false, bpm = null;
+  function update(f) { intensity = Math.min(1, Math.max(0, f.ms / Math.max(f.thr, 0.05) * 0.5)); motion = !!f.motion; bpm = f.bpm; }
+
+  const cool = new THREE.Color(0x58a6ff), hot = new THREE.Color(0xf85149);
+  let shown = 0, last = performance.now();
+  function tick(now) {
+    const dt = Math.min(0.1, (now - last) / 1000); last = now;
+    shown += (intensity - shown) * Math.min(1, dt * 6);
+    if (inner) {
+      const col = cool.clone().lerp(hot, shown);
+      inner.material.color.copy(col); outer.material.color.copy(col);
+      inner.material.opacity = 0.10 + 0.45 * shown;
+      outer.material.opacity = 0.04 + 0.22 * shown;
+      const br = bpm ? 1 + 0.04 * Math.sin(now / 1000 * 2 * Math.PI * bpm / 60) : 1;
+      outer.scale.set(outer.userData.base.x, outer.userData.base.y * br, outer.userData.base.z * br);
+      // motion -> particles drift through the zone; one link can't localize, so they spawn anywhere along it
+      if (motion && Math.random() < dt * 40 * (0.3 + shown)) {
+        const p = new THREE.Mesh(pGeo, new THREE.MeshBasicMaterial({color: 0xf85149, transparent: true}));
+        const r = outer.userData.base.y;
+        p.position.copy(a).lerp(b, Math.random()).add(new THREE.Vector3((Math.random() - .5) * r, (Math.random() - .5) * r, (Math.random() - .5) * r));
+        p.userData = {age: 0, v: new THREE.Vector3((Math.random() - .5) * .3, Math.random() * .3, (Math.random() - .5) * .3)};
+        linkGroup.add(p); particles.push(p);
+      }
+      particles = particles.filter(p => {
+        p.userData.age += dt; p.position.addScaledVector(p.userData.v, dt);
+        p.material.opacity = Math.max(0, 1 - p.userData.age / 1.5);
+        if (p.userData.age > 1.5) { linkGroup.remove(p); p.material.dispose(); return false; }
+        return true;
+      });
+    }
+    const r = host.getBoundingClientRect();
+    if (renderer.domElement.width !== Math.round(r.width * devicePixelRatio) || renderer.domElement.height !== Math.round(r.height * devicePixelRatio)) {
+      renderer.setSize(r.width, r.height, false); camera.aspect = r.width / r.height; camera.updateProjectionMatrix();
+    }
+    controls.update();
+    renderer.render(scene, camera);
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+  scene3d = {setConfig, update};
+  if (meta) setConfig(meta.config);
+}
+
 connect();
 render();
+init3d();
 </script>
 </body>
 </html>
