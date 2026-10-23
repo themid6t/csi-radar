@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSI Radar</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --line: #30363d; --text: #e6edf3; --muted: #8b949e;
+    --accent: #58a6ff; --motion: #f85149; --still: #3fb950; --warn: #d29922;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #f6f8fa; --panel: #ffffff; --line: #d0d7de; --text: #1f2328; --muted: #656d76;
+            --accent: #0969da; --motion: #cf222e; --still: #1a7f37; --warn: #9a6700; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 40px; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: .2px; }
+  .pill { padding: 4px 12px; border-radius: 999px; font-weight: 600; font-size: 13px;
+          border: 1px solid var(--line); background: var(--panel); }
+  .pill.motion { background: var(--motion); border-color: var(--motion); color: #fff; animation: pulse 1s infinite; }
+  .pill.still { color: var(--still); border-color: var(--still); }
+  .pill.cal, .pill.off { color: var(--warn); border-color: var(--warn); }
+  @keyframes pulse { 50% { opacity: .7; } }
+  .spacer { flex: 1; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .tile, .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  .tile { padding: 10px 14px; }
+  .tile .k { color: var(--muted); font-size: 12px; }
+  .tile .v { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .card { padding: 12px 14px 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 13px; font-weight: 600; color: var(--muted); margin: 0 0 8px;
+             display: flex; justify-content: space-between; gap: 8px; }
+  canvas { width: 100%; display: block; border-radius: 6px; }
+  #wf { height: 220px; image-rendering: pixelated; background: #000; }
+  #chart { height: 180px; }
+  .row { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; }
+  @media (max-width: 760px) { .row { grid-template-columns: 1fr; } }
+  button { font: inherit; padding: 6px 12px; border-radius: 6px; cursor: pointer;
+           border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+  button:hover { border-color: var(--accent); }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; }
+  #events { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; }
+  #events li { display: flex; justify-content: space-between; padding: 6px 0;
+               border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  #events li.live { color: var(--motion); font-weight: 600; }
+  .muted { color: var(--muted); }
+  .legend { font-weight: 400; }
+  footer { color: var(--muted); font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>CSI Radar</h1>
+    <span id="state" class="pill off">connecting…</span>
+    <span class="spacer"></span>
+    <div class="controls">
+      <button id="more" title="Lower the threshold">More sensitive</button>
+      <button id="less" title="Raise the threshold">Less sensitive</button>
+      <button id="cal" title="Keep the room still for ~10 s">Recalibrate</button>
+    </div>
+  </header>
+
+  <div class="tiles">
+    <div class="tile"><div class="k">Motion score</div><div class="v" id="score">–</div></div>
+    <div class="tile"><div class="k">Last motion</div><div class="v" id="last">–</div></div>
+    <div class="tile"><div class="k">Signal (RSSI)</div><div class="v" id="rssi">–</div></div>
+    <div class="tile"><div class="k">CSI packets / s</div><div class="v" id="pps">–</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Subcarrier waterfall <span class="legend">52 subcarriers × last 60 s · amplitude relative to frame mean</span></h2>
+    <canvas id="wf"></canvas>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <h2>Turbulence variance <span class="legend">log scale · dashed = threshold · red = motion</span></h2>
+      <canvas id="chart"></canvas>
+    </div>
+    <div class="card">
+      <h2>Events <span class="legend" id="evcount"></span></h2>
+      <ul id="events"><li class="muted">No motion yet</li></ul>
+    </div>
+  </div>
+  <footer>ESP32 pings the Pi's access point ~100×/s and reads Wi-Fi channel state on every reply. Motion = variance of subcarrier turbulence above the calibrated threshold.</footer>
+</main>
+
+<script>
+const N = 600, NSUB = 52;
+const frames = [];
+let events = [], online = false, thr = 0, last = null, dirty = true;
+const $ = id => document.getElementById(id);
+
+// colormap: dark blue -> teal -> yellow
+const STOPS = [[13, 8, 135], [84, 2, 163], [139, 10, 165], [185, 50, 137], [219, 92, 104], [244, 136, 73], [254, 188, 43], [240, 249, 33]];
+const CMAP = Array.from({length: 256}, (_, i) => {
+  const x = i / 255 * (STOPS.length - 1), a = Math.floor(x), b = Math.min(a + 1, STOPS.length - 1), t = x - a;
+  return STOPS[a].map((c, k) => Math.round(c + (STOPS[b][k] - c) * t));
+});
+
+const wfBuf = document.createElement("canvas");
+wfBuf.width = N; wfBuf.height = NSUB;
+const wfCtx = wfBuf.getContext("2d");
+wfCtx.fillStyle = "#000"; wfCtx.fillRect(0, 0, N, NSUB);
+const col = wfCtx.createImageData(1, NSUB);
+
+function pushColumn(amp) {
+  wfCtx.drawImage(wfBuf, -1, 0);
+  const mean = amp.reduce((a, b) => a + b, 0) / amp.length || 1;
+  for (let i = 0; i < NSUB; i++) {
+    const v = Math.max(0, Math.min(255, Math.round((amp[i] / mean - 0.4) / 1.2 * 255)));
+    const [r, g, b] = CMAP[v], o = (NSUB - 1 - i) * 4;  // subcarrier -26 at the bottom
+    col.data[o] = r; col.data[o + 1] = g; col.data[o + 2] = b; col.data[o + 3] = 255;
+  }
+  wfCtx.putImageData(col, N - 1, 0);
+}
+
+function fit(c) {
+  const r = c.getBoundingClientRect(), d = devicePixelRatio || 1;
+  if (c.width !== Math.round(r.width * d) || c.height !== Math.round(r.height * d)) {
+    c.width = Math.round(r.width * d); c.height = Math.round(r.height * d);
+  }
+  return c.getContext("2d");
+}
+
+function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+function drawWaterfall() {
+  const c = $("wf"), ctx = fit(c);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(wfBuf, 0, 0, c.width, c.height);
+}
+
+function drawChart() {
+  const c = $("chart"), ctx = fit(c), W = c.width, H = c.height, d = devicePixelRatio || 1;
+  ctx.clearRect(0, 0, W, H);
+  if (!frames.length) return;
+  const t = Math.log10(thr || frames[frames.length - 1].thr || 1e-4);
+  const lo = t - 2, hi = t + 2;
+  const y = v => H - (Math.min(hi, Math.max(lo, Math.log10(Math.max(v, 1e-12)))) - lo) / (hi - lo) * H;
+  const x = i => (i + N - frames.length) / (N - 1) * W;
+
+  ctx.fillStyle = css("--motion") + "33";
+  frames.forEach((f, i) => { if (f.motion) ctx.fillRect(x(i), 0, W / N + 1, H); });
+
+  ctx.strokeStyle = css("--line"); ctx.lineWidth = 1;
+  for (let k = Math.ceil(lo); k <= hi; k++) { ctx.beginPath(); ctx.moveTo(0, y(10 ** k)); ctx.lineTo(W, y(10 ** k)); ctx.stroke(); }
+
+  ctx.strokeStyle = css("--warn"); ctx.setLineDash([6 * d, 4 * d]); ctx.lineWidth = 1.5 * d;
+  ctx.beginPath(); frames.forEach((f, i) => i ? ctx.lineTo(x(i), y(f.thr)) : ctx.moveTo(x(i), y(f.thr))); ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.strokeStyle = css("--accent"); ctx.lineWidth = 1.5 * d;
+  ctx.beginPath(); frames.forEach((f, i) => i ? ctx.lineTo(x(i), y(f.var)) : ctx.moveTo(x(i), y(f.var))); ctx.stroke();
+}
+
+const fmtTime = s => new Date(s * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+function ago(s) {
+  const d = Date.now() / 1000 - s;
+  return d < 60 ? `${Math.round(d)}s ago` : d < 3600 ? `${Math.round(d / 60)}m ago` : `${Math.round(d / 3600)}h ago`;
+}
+
+function drawEvents() {
+  const ul = $("events");
+  $("evcount").textContent = events.length ? `${events.length} total` : "";
+  if (!events.length) { ul.innerHTML = '<li class="muted">No motion yet</li>'; return; }
+  ul.innerHTML = "";
+  for (const e of events.slice().reverse().slice(0, 50)) {
+    const li = document.createElement("li");
+    if (e.end === null) li.className = "live";
+    li.innerHTML = `<span>${fmtTime(e.start)}</span><span>${e.end === null ? "ongoing" : (e.end - e.start).toFixed(1) + " s"}</span>`;
+    ul.appendChild(li);
+  }
+}
+
+function drawStatus() {
+  const f = frames[frames.length - 1], s = $("state");
+  if (!online || !f) { s.className = "pill off"; s.textContent = "ESP32 offline"; }
+  else if (f.cal < 100) { s.className = "pill cal"; s.textContent = `calibrating ${f.cal}% · keep still`; }
+  else if (f.motion) { s.className = "pill motion"; s.textContent = "MOTION"; }
+  else { s.className = "pill still"; s.textContent = "still"; }
+  if (f) {
+    $("score").textContent = f.thr ? (f.var / f.thr).toFixed(2) + "×" : "–";
+    $("rssi").textContent = f.rssi + " dBm";
+    $("pps").textContent = f.pps;
+  }
+  const lastEv = events[events.length - 1];
+  $("last").textContent = lastEv ? (lastEv.end === null ? "now" : ago(lastEv.end)) : "–";
+}
+
+function render() {
+  if (dirty) { drawWaterfall(); drawChart(); drawStatus(); dirty = false; }
+  requestAnimationFrame(render);
+}
+
+function addFrame(f) {
+  frames.push(f); if (frames.length > N) frames.shift();
+  thr = f.thr; pushColumn(f.amp); dirty = true;
+}
+
+function connect() {
+  const es = new EventSource("events");
+  es.addEventListener("init", e => {
+    const d = JSON.parse(e.data);
+    frames.length = 0; online = d.online; events = d.events;
+    d.history.forEach(addFrame); drawEvents();
+  });
+  es.addEventListener("frame", e => { online = true; addFrame(JSON.parse(e.data)); });
+  es.addEventListener("events", e => { events = JSON.parse(e.data); drawEvents(); dirty = true; });
+  es.addEventListener("status", e => { online = JSON.parse(e.data).online; dirty = true; });
+  es.onerror = () => { online = false; dirty = true; };
+}
+
+function cmd(body) { return fetch("cmd", {method: "POST", body}); }
+$("more").onclick = () => thr && cmd(`thr ${(thr / 1.5).toPrecision(4)}`);
+$("less").onclick = () => thr && cmd(`thr ${(thr * 1.5).toPrecision(4)}`);
+$("cal").onclick = () => cmd("cal");
+
+addEventListener("resize", () => dirty = true);
+setInterval(() => { dirty = true; }, 5000);  // refresh "x ago"
+connect();
+render();
+</script>
+</body>
+</html>
