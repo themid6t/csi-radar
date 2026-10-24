@@ -1,7 +1,8 @@
 interface=wlan0
 driver=nl80211
 ssid=csi-radar
-country_code=IN
+# set your country code (regulatory domain)
+country_code=US
 hw_mode=g
 channel=1
 ieee80211n=1

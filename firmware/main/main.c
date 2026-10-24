@@ -24,7 +24,7 @@
 #define PORTAL_AFTER_US 45000000LL  // and at least 45 s without a connection
 
 static const char *TAG = "main";
-cfg_t cfg = { .relay = "vorp.themidst.xyz", .sub = "csi" };
+cfg_t cfg;  // all set on the setup page
 bool portal_mode;
 static esp_netif_t *sta;
 static uint8_t bssid[6];
