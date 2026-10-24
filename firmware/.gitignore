@@ -3,3 +3,4 @@ build/
 sdkconfig
 sdkconfig.old
 .ap_psk
+managed_components/

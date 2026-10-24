@@ -86,20 +86,21 @@
     <span id="breathPill" class="pill breath" hidden></span>
     <span class="spacer"></span>
     <span class="muted small" id="thrLabel"></span>
+    <a class="muted small" id="setupLink" href="/setup" hidden>Setup</a>
   </header>
 
   <div class="tiles">
     <div class="tile"><div class="k">Motion statistic</div><div class="v" id="ms">–</div><div class="s">0 = static · 1 = strong motion</div></div>
     <div class="tile"><div class="k">Breathing</div><div class="v" id="bpm">–</div><div class="s">experimental · still person near the link</div></div>
     <div class="tile"><div class="k">Last motion</div><div class="v" id="last">–</div><div class="s" id="evtotal"></div></div>
-    <div class="tile"><div class="k">Signal (RSSI)</div><div class="v" id="rssi">–</div><div class="s">ESP32 ← Pi</div></div>
+    <div class="tile"><div class="k">Signal (RSSI)</div><div class="v" id="rssi">–</div><div class="s">ESP32 ← AP</div></div>
     <div class="tile"><div class="k">CSI packets / s</div><div class="v" id="pps">–</div><div class="s">target ~100</div></div>
   </div>
 
   <div class="row">
     <div class="card">
       <h2>Room <span class="legend">drag to orbit · scroll to zoom</span></h2>
-      <div id="scene"><div class="note">One link senses motion inside the glowing zone around the Pi–ESP32 line (Fresnel zones). It can't tell where along the zone the motion is; more ESP32s would be needed for that.</div></div>
+      <div id="scene"><div class="note">One link senses motion inside the glowing zone around the AP–ESP32 line (Fresnel zones). It can't tell where along the zone the motion is; more ESP32s would be needed for that.</div></div>
     </div>
     <div class="card">
       <h2>Events <span class="legend" id="evcount"></span></h2>
@@ -117,7 +118,7 @@
     <div class="card">
       <h2>Tuning</h2>
       <label class="thr"><span>Threshold</span><input type="range" id="thr" min="0.05" max="0.8" step="0.01"><b id="thrVal">–</b></label>
-      <p class="muted small">Record each situation for 30 s and the threshold is tuned from your room. Start with "Empty room" (leave the room), then "Walking" (walk around between the Pi and the ESP32).</p>
+      <p class="muted small">Record each situation for 30 s and the threshold is tuned from your room. Start with "Empty room" (leave the room), then "Walking" (walk around between the AP and the ESP32).</p>
       <div class="btns">
         <button data-rec="empty">Empty room</button>
         <button data-rec="walking">Walking</button>
@@ -133,20 +134,20 @@
         <div class="grid3">
           <span></span><span class="muted small">x / width</span><span class="muted small">y / depth</span><span class="muted small">z / height</span>
           <span>Room</span><input data-k="room" data-i="0" type="number" step="0.1"><input data-k="room" data-i="1" type="number" step="0.1"><input data-k="room" data-i="2" type="number" step="0.1">
-          <span>Pi</span><input data-k="pi" data-i="0" type="number" step="0.1"><input data-k="pi" data-i="1" type="number" step="0.1"><input data-k="pi" data-i="2" type="number" step="0.1">
+          <span>AP</span><input data-k="pi" data-i="0" type="number" step="0.1"><input data-k="pi" data-i="1" type="number" step="0.1"><input data-k="pi" data-i="2" type="number" step="0.1">
           <span>ESP32</span><input data-k="esp" data-i="0" type="number" step="0.1"><input data-k="esp" data-i="1" type="number" step="0.1"><input data-k="esp" data-i="2" type="number" step="0.1">
         </div>
         <button id="saveCfg">Save</button> <span class="small muted" id="cfgMsg"></span>
       </details>
     </div>
   </div>
-  <footer>The ESP32 pings the Pi's access point ~100×/s and streams the channel state of every reply. Motion = lag-1 autocorrelation of subcarrier amplitudes over 1 s (WiDetect). Breathing = 0.1–0.7 Hz peak of the top principal components over 30 s.</footer>
+  <footer>Everything runs on the ESP32: it pings its access point ~100×/s and reads the channel state of every reply. Motion = lag-1 autocorrelation of subcarrier amplitudes over 1 s (WiDetect). Breathing = 0.1–0.7 Hz peak of the top principal components over 30 s.</footer>
 </main>
 
 <script type="module">
 const N = 600, NSUB = 52;
 const frames = [];
-let events = [], online = false, meta = null, dirty = true;
+let events = [], online = false, unsupported = false, meta = null, dirty = true, off = 0;  // off: ESP32 uptime -> epoch
 const $ = id => document.getElementById(id);
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 
@@ -226,7 +227,8 @@ function drawEvents() {
 }
 function drawStatus() {
   const f = frames[frames.length - 1], s = $("state");
-  if (!online || !f) { s.className = "pill off"; s.textContent = "ESP32 offline"; }
+  if (unsupported) { s.className = "pill off"; s.textContent = "AP not supported (no CSI)"; s.title = "This access point sends the ESP32 only 802.11b frames, which carry no channel state. Use an AP that sends 802.11g/n."; }
+  else if (!online || !f) { s.className = "pill off"; s.textContent = "no CSI"; }
   else if (f.motion) { s.className = "pill motion"; s.textContent = "MOTION"; }
   else { s.className = "pill still"; s.textContent = "no motion"; }
   const bp = $("breathPill");
@@ -282,16 +284,20 @@ function connect() {
   const es = new EventSource("events");
   es.addEventListener("init", e => {
     const d = JSON.parse(e.data);
-    frames.length = 0; online = d.online; events = d.events; meta = d.meta;
+    off = Date.now() / 1000 - d.now;
+    frames.length = 0; online = d.online; unsupported = d.unsupported; events = toEpoch(d.events); meta = d.meta;
     d.history.forEach(addFrame); drawEvents(); drawMeta();
   });
-  es.addEventListener("frame", e => { online = true; const f = JSON.parse(e.data); addFrame(f); scene3d?.update(f); });
-  es.addEventListener("events", e => { events = JSON.parse(e.data); drawEvents(); dirty = true; });
+  es.addEventListener("frame", e => { const f = JSON.parse(e.data); addFrame(f); scene3d?.update(f); });
+  es.addEventListener("events", e => { events = toEpoch(JSON.parse(e.data)); drawEvents(); dirty = true; });
   es.addEventListener("meta", e => { meta = JSON.parse(e.data); drawMeta(); });
-  es.addEventListener("status", e => { online = JSON.parse(e.data).online; dirty = true; });
+  es.addEventListener("status", e => { ({online, unsupported} = JSON.parse(e.data)); dirty = true; });
   es.onerror = () => { online = false; dirty = true; };
 }
+const toEpoch = evs => evs.map(e => ({start: e.start + off, end: e.end === null ? null : e.end + off}));
 const cmd = body => fetch("cmd", {method: "POST", body});
+// setup is only served on the local network, not through the public link
+$("setupLink").hidden = !/^(\d+\.){3}\d+$|\.local$/.test(location.hostname);
 document.querySelectorAll("[data-rec]").forEach(b => b.onclick = () => cmd("rec " + b.dataset.rec));
 $("cal").onclick = () => cmd("cal");
 $("thr").oninput = e => $("thrVal").textContent = (+e.target.value).toFixed(2);
@@ -363,7 +369,7 @@ async function init3d() {
     pi.position.copy(a); linkGroup.add(pi);
     const esp = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.02, 0.05), new THREE.MeshStandardMaterial({color: 0x58a6ff}));
     esp.position.copy(b); linkGroup.add(esp);
-    for (const [p, t, c] of [[a, "Pi (AP)", "#3fb950"], [b, "ESP32", "#58a6ff"]]) {
+    for (const [p, t, c] of [[a, "AP", "#3fb950"], [b, "ESP32", "#58a6ff"]]) {
       const l = label(t, c); l.position.copy(p).add(new THREE.Vector3(0, 0.25, 0)); linkGroup.add(l);
       const stem = new THREE.Line(new THREE.BufferGeometry().setFromPoints([p, new THREE.Vector3(p.x, 0, p.z)]),
                                   new THREE.LineDashedMaterial({color: 0x3a4250, dashSize: 0.05, gapSize: 0.05}));

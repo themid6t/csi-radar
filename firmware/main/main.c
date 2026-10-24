@@ -1,138 +1,165 @@
-// Wi-Fi CSI capture: ping the Pi's AP at 100 Hz, read CSI off its replies, stream raw I/Q to the Pi.
-// Detection runs on the Pi (easier to iterate); it drives the LED back over UDP.
+// CSI radar, all on the ESP32: joins the saved Wi-Fi, senses motion from the AP's ping replies (radar.c),
+// serves the page locally (web.c) and through a vorp tunnel when a token is set (vorp.c).
+// No saved Wi-Fi, or it fails 5+ times and for 45 s before ever connecting: open AP "csi-radar-setup" + captive setup page
+// (the saved network is still retried every 2 min).
+// Hold BOOT for 5 s to forget the Wi-Fi settings.
+#include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
-#include "lwip/sockets.h"
-#include "ping/ping_sock.h"
-#include "secrets.h"  // WIFI_SSID, WIFI_PASS, PI_HOST, ESP_IP (gitignored)
+#include "mdns.h"
+#include "app.h"
 
-#define PI_PORT   5005
-#define CMD_PORT  5006
-#define LED_GPIO  2
-#define NSUB      52    // LLTF subcarriers -26..-1, 1..26
-#define BATCH     10    // packets per UDP datagram (~10 datagrams/s)
+#define BOOT_GPIO   0
+#define LED_GPIO    2
+#define SETUP_SSID  "csi-radar-setup"
+#define MAX_FAILS   5
+#define PORTAL_AFTER_US 45000000LL  // and at least 45 s without a connection
 
-static const char *TAG = "radar";
+static const char *TAG = "main";
+cfg_t cfg = { .relay = "vorp.themidst.xyz", .sub = "csi" };
+bool portal_mode;
+static esp_netif_t *sta;
+static uint8_t bssid[6];
+static bool ever_ip, have_ip;
+static int fails;
+static char status_buf[256];
 
-// wire format (little-endian): "CS", version=2, count, then count x { u32 ms, i8 rssi, i8 iq[2*NSUB] (imag, real) }
-typedef struct __attribute__((packed)) { uint32_t ms; int8_t rssi; int8_t iq[2 * NSUB]; } sample_t;
-
-static QueueHandle_t q;
-static uint8_t ap_bssid[6];
-
-static void csi_cb(void *ctx, wifi_csi_info_t *info) {
-    if (info->len < 128 || memcmp(info->mac, ap_bssid, 6)) return;
-    sample_t s = { .ms = esp_timer_get_time() / 1000, .rssi = info->rx_ctrl.rssi };
-    // buf = (imag, real) int8 pairs; index k<32 is subcarrier k, k>=32 is k-64.
-    // Keep -26..-1 (k=38..63) then 1..26 (k=1..26); skip DC and guard bands.
-    memcpy(s.iq, info->buf + 2 * 38, 2 * 26);
-    memcpy(s.iq + 2 * 26, info->buf + 2 * 1, 2 * 26);
-    xQueueSend(q, &s, 0);  // drop if the sender is behind
+static void load(nvs_handle_t h, const char *k, char *dst, size_t n) {
+    size_t len = n;
+    if (nvs_get_str(h, k, dst, &len) != ESP_OK) return;  // keep the default
 }
 
-static void send_task(void *arg) {
-    int tx = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in pi = { .sin_family = AF_INET, .sin_port = htons(PI_PORT) };
-    inet_pton(AF_INET, PI_HOST, &pi.sin_addr);
-    static uint8_t pkt[4 + BATCH * sizeof(sample_t)] = { 'C', 'S', 2 };
-    int n = 0;
-    for (;;) {
-        if (!xQueueReceive(q, pkt + 4 + n * sizeof(sample_t), portMAX_DELAY)) continue;
-        if (++n < BATCH) continue;
-        pkt[3] = n;
-        sendto(tx, pkt, 4 + n * sizeof(sample_t), 0, (struct sockaddr *)&pi, sizeof pi);
-        n = 0;
-    }
+static void cfg_load(void) {
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READONLY, &h) != ESP_OK) return;
+    load(h, "ssid", cfg.ssid, sizeof cfg.ssid);
+    load(h, "pass", cfg.pass, sizeof cfg.pass);
+    load(h, "token", cfg.token, sizeof cfg.token);
+    load(h, "relay", cfg.relay, sizeof cfg.relay);
+    load(h, "sub", cfg.sub, sizeof cfg.sub);
+    nvs_close(h);
 }
 
-// "led 0" / "led 1"
-static void cmd_task(void *arg) {
-    int rx = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in me = { .sin_family = AF_INET, .sin_port = htons(CMD_PORT), .sin_addr.s_addr = htonl(INADDR_ANY) };
-    bind(rx, (struct sockaddr *)&me, sizeof me);
-    char buf[16];
-    for (;;) {
-        int n = recv(rx, buf, sizeof buf - 1, 0);
-        if (n <= 0) continue;
-        buf[n] = 0;
-        if (!strncmp(buf, "led ", 4)) gpio_set_level(LED_GPIO, buf[4] == '1');
-    }
+void cfg_save(void) {
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_str(h, "ssid", cfg.ssid);
+    nvs_set_str(h, "pass", cfg.pass);
+    nvs_set_str(h, "token", cfg.token);
+    nvs_set_str(h, "relay", cfg.relay);
+    nvs_set_str(h, "sub", cfg.sub);
+    nvs_commit(h);
+    nvs_close(h);
 }
 
-static void start_ping(esp_ip4_addr_t gw) {
-    static esp_ping_handle_t ping;
-    if (ping) return;
-    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
-    cfg.target_addr.u_addr.ip4.addr = gw.addr;
-    cfg.target_addr.type = IPADDR_TYPE_V4;
-    cfg.count = ESP_PING_COUNT_INFINITE;
-    cfg.interval_ms = 10;
-    cfg.timeout_ms = 15;  // esp_ping waits for each reply; a long timeout stalls CSI for that long on every lost packet
-    cfg.data_size = 1;
-    esp_ping_callbacks_t cbs = {0};
-    ESP_ERROR_CHECK(esp_ping_new_session(&cfg, &cbs, &ping));
-    esp_ping_start(ping);
+const char *wifi_status(void) {
+    esp_netif_ip_info_t ip = { 0 };
+    wifi_ap_record_t ap = { 0 };
+    if (have_ip) { esp_netif_get_ip_info(sta, &ip); esp_wifi_sta_get_ap_info(&ap); }
+    snprintf(status_buf, sizeof status_buf, "{\"portal\":%s,\"ssid\":\"%s\",\"connected\":%s,\"ip\":\"" IPSTR "\",\"rssi\":%d,"
+             "\"uptime\":%lld,\"reset\":%d}", portal_mode ? "true" : "false", cfg.ssid, have_ip ? "true" : "false", IP2STR(&ip.ip),
+             ap.rssi, esp_timer_get_time() / 1000000, esp_reset_reason());  // reset: esp_reset_reason_t, 1 = power-on, 4 = panic
+    return status_buf;
 }
 
-static void start_csi(void) {
-    wifi_csi_config_t csi = { .lltf_en = true, .htltf_en = false, .stbc_htltf2_en = false,
-                              .ltf_merge_en = true, .channel_filter_en = false, .manu_scale = false };
-    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi));
-    ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(csi_cb, NULL));
-    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+static void start_portal(void) {
+    if (portal_mode) return;
+    portal_mode = true;
+    ESP_LOGW(TAG, "no usable Wi-Fi, starting setup AP \"%s\"", SETUP_SSID);
+    esp_wifi_disconnect();
+    wifi_config_t ap = { .ap = { .ssid = SETUP_SSID, .ssid_len = strlen(SETUP_SSID), .channel = 1,
+                                 .authmode = WIFI_AUTH_OPEN, .max_connection = 4 } };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));  // STA side stays idle, for scanning
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
+    web_portal();
 }
 
 static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) esp_wifi_connect();
-    else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) { ESP_LOGW(TAG, "wifi lost, retrying"); esp_wifi_connect(); }
-    else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) memcpy(ap_bssid, ((wifi_event_sta_connected_t *)data)->bssid, 6);
-    else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        if (!portal_mode) esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+        memcpy(bssid, ((wifi_event_sta_connected_t *)data)->bssid, 6);
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        have_ip = false;
+        if (portal_mode) return;
+        // once it has worked, keep retrying forever (the AP may just be rebooting)
+        int reason = ((wifi_event_sta_disconnected_t *)data)->reason;
+        if (!ever_ip && ++fails >= MAX_FAILS && esp_timer_get_time() > PORTAL_AFTER_US) start_portal();
+        else { ESP_LOGW(TAG, "wifi lost (reason %d), retrying", reason); esp_wifi_connect(); }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = data;
         ESP_LOGI(TAG, "ip " IPSTR " gw " IPSTR, IP2STR(&e->ip_info.ip), IP2STR(&e->ip_info.gw));
-        start_csi();
-        start_ping(e->ip_info.gw);
+        ever_ip = have_ip = true;
+        fails = 0;
+        if (portal_mode) {  // the saved network came back while we were waiting in setup
+            portal_mode = false;
+            esp_wifi_set_mode(WIFI_MODE_STA);
+            gpio_set_level(LED_GPIO, 0);
+        }
+        radar_link_up(bssid, e->ip_info.gw.addr);
+        vorp_start();
+    }
+}
+
+static void button_task(void *arg) {
+    int held = 0;
+    for (int tick = 0;; tick++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (portal_mode) gpio_set_level(LED_GPIO, tick / 5 % 2);  // slow blink: waiting for setup
+        if (portal_mode && cfg.ssid[0] && tick % 1200 == 600) esp_wifi_connect();  // retry the saved network every 2 min
+        held = gpio_get_level(BOOT_GPIO) ? 0 : held + 1;
+        if (held == 50) {
+            ESP_LOGW(TAG, "BOOT held 5 s: forgetting Wi-Fi");
+            cfg.ssid[0] = cfg.pass[0] = 0;
+            cfg_save();
+            esp_restart();
+        }
     }
 }
 
 void app_main(void) {
-    gpio_reset_pin(LED_GPIO);
-    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
-
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
         nvs_flash_init();
     }
+    cfg_load();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_t *sta = esp_netif_create_default_wifi_sta();
-    // static IP: the Pi AP has no DHCP server
-    esp_netif_dhcpc_stop(sta);
-    esp_netif_ip_info_t ip = {0};
-    ip.ip.addr = ipaddr_addr(ESP_IP);
-    ip.gw.addr = ipaddr_addr(PI_HOST);
-    ip.netmask.addr = ipaddr_addr("255.255.255.0");
-    ESP_ERROR_CHECK(esp_netif_set_ip_info(sta, &ip));
+    sta = esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
+    esp_netif_set_hostname(sta, "csi-radar");
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init));
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_event, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_event, NULL);
 
-    wifi_config_t wc = { .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS } };
+    radar_start();  // also sets up the LED
+    gpio_reset_pin(BOOT_GPIO);
+    gpio_set_direction(BOOT_GPIO, GPIO_MODE_INPUT);
+    gpio_pullup_en(BOOT_GPIO);
+
+    wifi_config_t wc = { 0 };
+    strcpy((char *)wc.sta.ssid, cfg.ssid);
+    strcpy((char *)wc.sta.password, cfg.pass);
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));  // our own NVS keys are the source of truth
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+    if (!cfg.ssid[0]) start_portal();
     ESP_ERROR_CHECK(esp_wifi_start());
     esp_wifi_set_ps(WIFI_PS_NONE);  // power save would drop most CSI
 
-    q = xQueueCreate(64, sizeof(sample_t));
-
-    xTaskCreate(send_task, "send", 4096, NULL, 5, NULL);
-    xTaskCreate(cmd_task, "cmd", 3072, NULL, 4, NULL);
+    web_start();
+    mdns_init();
+    mdns_hostname_set("csi-radar");
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+    xTaskCreate(button_task, "button", 2560, NULL, 2, NULL);
 }

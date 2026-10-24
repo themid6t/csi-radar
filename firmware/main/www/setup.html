@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CSI Radar Setup</title>
+<style>
+  :root { --bg: #0d1117; --panel: #161b22; --line: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff; --ok: #3fb950; --warn: #d29922; }
+  @media (prefers-color-scheme: light) { :root { --bg: #f6f8fa; --panel: #fff; --line: #d0d7de; --text: #1f2328; --muted: #656d76; --accent: #0969da; --ok: #1a7f37; --warn: #9a6700; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 480px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+  .row { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; }
+  .k { color: var(--muted); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); }
+  label { display: block; margin: 10px 0 4px; color: var(--muted); font-size: 13px; }
+  input, select { width: 100%; font: inherit; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  input[type=checkbox] { width: auto; }
+  button { font: inherit; padding: 8px 14px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; margin-top: 14px; }
+  button.plain { background: var(--panel); color: var(--text); border-color: var(--line); margin: 0; padding: 4px 10px; font-size: 13px; }
+  details summary { cursor: pointer; color: var(--muted); margin-top: 12px; }
+  .small { font-size: 13px; color: var(--muted); }
+  a { color: var(--accent); }
+  #msg { margin-top: 10px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>CSI Radar Setup</h1>
+  <div class="card" id="status"><span class="k">Loading…</span></div>
+  <form class="card" id="f">
+    <label for="net">Wi-Fi network <button type="button" class="plain" id="rescan">Scan</button></label>
+    <select id="net"><option value="">Scanning…</option></select>
+    <input id="ssid" placeholder="or type a network name" style="margin-top:6px" maxlength="32">
+    <label for="pass">Password</label>
+    <input id="pass" type="password" maxlength="64" placeholder="leave empty for an open network">
+    <p class="small">The network's access point must send 802.11g/n frames to the ESP32. Ones that only use 802.11b give no CSI, and the radar page will say "not supported".</p>
+    <details id="adv">
+      <summary>Public link (vorp tunnel)</summary>
+      <label for="token">Agent token</label>
+      <input id="token" type="password" autocomplete="off" maxlength="127">
+      <label><input type="checkbox" id="clear"> Remove the saved token (local access only)</label>
+      <label for="sub">Subdomain (empty = random name)</label>
+      <input id="sub" maxlength="63">
+      <label for="relay">Relay</label>
+      <input id="relay" maxlength="63">
+    </details>
+    <button>Save and restart</button>
+    <div id="msg" class="small"></div>
+  </form>
+  <p class="small">Hold the BOOT button for 5 s to forget the Wi-Fi settings.</p>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+async function state() {
+  const s = await (await fetch("/setup/state")).json(), w = s.wifi, t = s.tunnel;
+  const tun = t.state === "online" ? `<span class="ok">online</span> · <a href="${esc(t.url)}">${esc(t.url)}</a>`
+            : t.state === "off" ? '<span class="k">off (no token)</span>'
+            : `<span class="warn">${esc(t.state)}${t.error ? " · " + esc(t.error) : ""}</span>`;
+  $("status").innerHTML =
+    `<div class="row"><span class="k">Wi-Fi</span><span>${w.connected ? `<span class="ok">${esc(w.ssid)}</span> · ${w.ip} · ${w.rssi} dBm`
+      : w.portal ? '<span class="warn">setup mode</span>' : `<span class="warn">connecting to ${esc(w.ssid)}…</span>`}</span></div>` +
+    `<div class="row"><span class="k">Public link</span><span>${tun}</span></div>` +
+    (w.connected ? `<div class="row"><span class="k">Radar</span><a href="/">open the radar page</a></div>` : "");
+  if (!$("sub").dataset.set) { $("sub").value = s.sub; $("relay").value = s.relay; $("sub").dataset.set = 1; }
+  $("token").placeholder = s.token ? "saved; leave empty to keep it" : "vorp_…";
+}
+async function scan() {
+  $("net").innerHTML = "<option value=''>Scanning…</option>";
+  const aps = await (await fetch("/scan")).json(), seen = new Set();
+  $("net").innerHTML = "<option value=''>Choose a network</option>" + aps.sort((a, b) => b.rssi - a.rssi)
+    .filter(a => !seen.has(a.ssid) && seen.add(a.ssid))
+    .map(a => `<option value="${esc(a.ssid)}">${esc(a.ssid)} (${a.rssi} dBm${a.open ? ", open" : ""})</option>`).join("");
+}
+$("rescan").onclick = scan;
+$("f").onsubmit = async e => {
+  e.preventDefault();
+  const body = {ssid: $("ssid").value.trim() || $("net").value, pass: $("pass").value,
+                token: $("token").value.trim(), sub: $("sub").value.trim(), relay: $("relay").value.trim(), clear_token: $("clear").checked};
+  if (!body.ssid) delete body.pass;
+  const r = await fetch("/setup", {method: "POST", body: JSON.stringify(body)});
+  $("msg").textContent = r.ok ? "Saved. Restarting… rejoin your usual Wi-Fi, then open http://csi-radar.local or the public link." : "Couldn't save (" + r.status + ").";
+};
+state().catch(() => {}); scan().catch(() => {});
+setInterval(() => state().catch(() => {}), 5000);
+</script>
+</body>
+</html>

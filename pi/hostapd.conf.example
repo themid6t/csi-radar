@@ -14,3 +14,5 @@ wpa_passphrase=CHANGE_ME
 # OFDM-only: 11b (DSSS) frames carry no CSI, so never let rate control fall back to them
 supported_rates=60 90 120 180 240 360 480 540
 basic_rates=60 120 240
+# drop a station that went silent (e.g. the ESP32 was reset) fast, or its rejoin is ignored until then
+ap_max_inactivity=20
