@@ -119,3 +119,7 @@ Check the detection code on a PC: `cc firmware/main/test_dsp.c firmware/main/dsp
 | Public link stuck on "waiting for the clock" | The board needs NTP (UDP 123) to reach `time.cloudflare.com` or `pool.ntp.org`. |
 
 To watch the logs: `idf.py -p /dev/ttyUSB0 monitor`. Note that opening the serial port resets most dev boards.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
