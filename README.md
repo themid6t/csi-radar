@@ -115,6 +115,7 @@ Check the detection code on a PC: `cc firmware/main/test_dsp.c firmware/main/dsp
 | `csi-radar.local` doesn't resolve | Use the board's IP from your router. Android often lacks mDNS. |
 | "AP not supported (no CSI)" | The AP sends 802.11b. See [Access point](#access-point). |
 | Low "CSI packets / s" (normal is ~90–100) | Move the board closer to the AP, or change to a less busy channel. |
+| CSI rate drops for a few seconds every ~15 s, on any channel | The AP's radio is going deaf on a schedule. On a Raspberry Pi AP, Wi-Fi shares its radio with Bluetooth, and a running Bluetooth scan (`bluetoothctl show` says `Discovering: yes`) causes exactly this. Stop it with `bluetoothctl power off` then `power on`, or disable Bluetooth if you don't use it. |
 | Public link: `SUBDOMAIN_NOT_ALLOWED` / `SUBDOMAIN_TAKEN` | The token doesn't allow that name, or another agent holds it. The board retries a taken name every 60 s. |
 | Public link stuck on "waiting for the clock" | The board needs NTP (UDP 123) to reach `time.cloudflare.com` or `pool.ntp.org`. |
 
